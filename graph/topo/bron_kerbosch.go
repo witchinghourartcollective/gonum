@@ -133,119 +133,146 @@ func degeneracyOrdering(g graph.Undirected) (l []graph.Node, s []int) {
 }
 
 // BronKerbosch returns the set of maximal cliques of the undirected graph g.
+//
+// The algorithm used is Bron–Kerbosch with an outer degeneracy ordering
+// (Eppstein, Löffler and Strash) and the pivot rule of Tomita, Tanaka and
+// Takahashi, which selects the pivot u ∈ P ∪ X maximising |P ∩ N(u)|. This
+// gives a worst-case running time of O(3^(n/3)), which is optimal for listing
+// all maximal cliques.
+//
+// See https://doi.org/10.1016/j.tcs.2006.06.015 and
+// https://doi.org/10.1007/978-3-642-17517-6_36.
 func BronKerbosch(g graph.Undirected) [][]graph.Node {
 	nodes := graph.NodesOf(g.Nodes())
 
-	// The algorithm used here is essentially BronKerbosch3 as described at
-	// http://en.wikipedia.org/w/index.php?title=Bron%E2%80%93Kerbosch_algorithm&oldid=656805858
+	// Build the adjacency sets once; the recursion would otherwise
+	// repeatedly materialise neighbour lists from g.
+	adj := make(map[int64]set.Nodes, len(nodes))
+	for _, n := range nodes {
+		nid := n.ID()
+		to := g.From(nid)
+		nb := set.NewNodesSize(to.Len())
+		for to.Next() {
+			u := to.Node()
+			if u.ID() == nid {
+				// Self loops do not contribute to cliques.
+				continue
+			}
+			nb.Add(u)
+		}
+		adj[nid] = nb
+	}
 
 	p := set.NewNodesSize(len(nodes))
 	for _, n := range nodes {
 		p.Add(n)
 	}
 	x := set.NewNodes()
-	var bk bronKerbosch
+	bk := bronKerbosch{adj: adj}
 	order, _ := degeneracyOrdering(g)
 	slices.Reverse(order)
 	for _, v := range order {
-		neighbours := graph.NodesOf(g.From(v.ID()))
-		nv := set.NewNodesSize(len(neighbours))
-		for _, n := range neighbours {
-			nv.Add(n)
-		}
-		bk.maximalCliquePivot(g, []graph.Node{v}, set.IntersectionOfNodes(p, nv), set.IntersectionOfNodes(x, nv))
+		nv := adj[v.ID()]
+		bk.maximalCliquePivot([]graph.Node{v}, intersect(p, nv), intersect(x, nv))
 		p.Remove(v)
 		x.Add(v)
 	}
-	return bk
+	return bk.cliques
 }
 
-type bronKerbosch [][]graph.Node
+type bronKerbosch struct {
+	adj     map[int64]set.Nodes
+	cliques [][]graph.Node
+}
 
-func (bk *bronKerbosch) maximalCliquePivot(g graph.Undirected, r []graph.Node, p, x set.Nodes) {
+func (bk *bronKerbosch) maximalCliquePivot(r []graph.Node, p, x set.Nodes) {
 	if len(p) == 0 && len(x) == 0 {
-		*bk = append(*bk, r)
+		bk.cliques = append(bk.cliques, r)
 		return
 	}
 
-	neighbours := bk.choosePivotFrom(g, p, x)
-	nu := set.NewNodesSize(len(neighbours))
-	for _, n := range neighbours {
-		nu.Add(n)
+	nu := bk.adj[bk.choosePivotFrom(p, x).ID()]
+
+	// Collect P \ N(u) before mutating p.
+	candidates := make([]graph.Node, 0, len(p))
+	for id, v := range p {
+		if _, ok := nu[id]; !ok {
+			candidates = append(candidates, v)
+		}
 	}
-	for _, v := range p {
-		if nu.Has(v) {
-			continue
-		}
-		vid := v.ID()
-		neighbours := graph.NodesOf(g.From(vid))
-		nv := set.NewNodesSize(len(neighbours))
-		for _, n := range neighbours {
-			nv.Add(n)
-		}
-
-		var found bool
-		for _, n := range r {
-			if n.ID() == vid {
-				found = true
-				break
-			}
-		}
-		var sr []graph.Node
-		if !found {
-			sr = append(r[:len(r):len(r)], v)
-		}
-
-		bk.maximalCliquePivot(g, sr, set.IntersectionOfNodes(p, nv), set.IntersectionOfNodes(x, nv))
+	for _, v := range candidates {
+		nv := bk.adj[v.ID()]
+		sr := append(r[:len(r):len(r)], v)
+		bk.maximalCliquePivot(sr, intersect(p, nv), intersect(x, nv))
 		p.Remove(v)
 		x.Add(v)
 	}
 }
 
-func (*bronKerbosch) choosePivotFrom(g graph.Undirected, p, x set.Nodes) (neighbors []graph.Node) {
-	// TODO(kortschak): Investigate the impact of pivot choice that maximises
-	// |p ⋂ neighbours(u)| as a function of input size. Until then, leave as
-	// compile time option.
-	if !tomitaTanakaTakahashi {
-		for _, n := range p {
-			return graph.NodesOf(g.From(n.ID()))
-		}
-		for _, n := range x {
-			return graph.NodesOf(g.From(n.ID()))
-		}
-		panic("bronKerbosch: empty set")
-	}
-
+// choosePivotFrom returns the node u in p ∪ x that maximises |p ∩ N(u)|,
+// following Tomita, Tanaka and Takahashi.
+func (bk *bronKerbosch) choosePivotFrom(p, x set.Nodes) graph.Node {
 	var (
-		max   = -1
+		best  = -1
 		pivot graph.Node
 	)
-	maxNeighbors := func(s set.Nodes) {
-	outer:
+	consider := func(s set.Nodes) {
 		for _, u := range s {
-			nb := graph.NodesOf(g.From(u.ID()))
-			c := len(nb)
-			if c <= max {
+			nb := bk.adj[u.ID()]
+			if len(nb) <= best {
+				// Cannot beat the current best.
 				continue
 			}
-			for n := range nb {
-				if _, ok := p[int64(n)]; ok {
-					continue
-				}
-				c--
-				if c <= max {
-					continue outer
+			c := intersectionCount(p, nb, best)
+			if c > best {
+				best = c
+				pivot = u
+				if best == len(p) {
+					return
 				}
 			}
-			max = c
-			pivot = u
-			neighbors = nb
 		}
 	}
-	maxNeighbors(p)
-	maxNeighbors(x)
+	consider(p)
+	if best < len(p) {
+		consider(x)
+	}
 	if pivot == nil {
 		panic("bronKerbosch: empty set")
 	}
-	return neighbors
+	return pivot
+}
+
+// intersectionCount returns |a ∩ b|. It may return early with a value less
+// than or equal to floor once the count can no longer exceed floor.
+func intersectionCount(a, b set.Nodes, floor int) int {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	var c int
+	remaining := len(a)
+	for id := range a {
+		remaining--
+		if _, ok := b[id]; ok {
+			c++
+		}
+		if c+remaining <= floor {
+			return c
+		}
+	}
+	return c
+}
+
+// intersect returns a new set holding a ∩ b, iterating over the smaller set.
+func intersect(a, b set.Nodes) set.Nodes {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	dst := make(set.Nodes, len(a))
+	for id, n := range a {
+		if _, ok := b[id]; ok {
+			dst[id] = n
+		}
+	}
+	return dst
 }
